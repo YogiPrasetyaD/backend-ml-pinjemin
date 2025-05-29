@@ -57,8 +57,8 @@ def load_product_metadata_from_db():
     cursor = None
     try:
         cursor = db.cursor(dictionary=True)
-        # Fetch 'description' column as well if needed for TF-IDF
-        query = "SELECT id AS product_id, name AS product_name, user_id AS seller_id, price_sell AS product_price, description FROM items" # Added description
+        # MODIFIED QUERY: Fetch 'category_id' column as well
+        query = "SELECT id AS product_id, name AS product_name, user_id AS seller_id, price_sell AS product_price, description, category_id FROM items" # Added category_id
         print(f"Executing query: {query}")
         cursor.execute(query)
         results = cursor.fetchall()
@@ -73,14 +73,16 @@ def load_product_metadata_from_db():
                 return default
 
         for idx, row in enumerate(results):
+             # Populate dictionaries using the ALIASED names from the query results
             product_id = int(row["product_id"])
             product_data[idx] = {
                 "product_name": row["product_name"],
                 "seller_id": int(row["seller_id"]),
                 "product_rating": safe_float(row.get("product_rating")), # Will likely be None unless added to DB
                 "product_price": safe_float(row.get("product_price")),
+                "category_id": row.get("category_id"), # Store category_id
                 # Combine name and description for text features, handle None
-                "text_features": f"{row.get('product_name', '')} {row.get('description', '') or ''}".strip() # Use name + description
+                "text_features": f"{row.get('product_name', '')} {row.get('description', '') or ''}".strip()
             }
             product_id_to_index[product_id] = idx
             index_to_product_id[idx] = product_id
@@ -100,24 +102,18 @@ def load_product_metadata_from_db():
     return product_texts # Return whatever was loaded, potentially empty list
 
 # Optional: Connect on startup, load data, and regenerate TF-IDF
-@app.on_event("startup") # Modified startup_event
+@app.on_event("startup")
 async def startup_event():
-    get_db_connection() # Connect to DB
-    # Load product data and get text features list
-    product_texts = load_product_metadata_from_db()
-
-    # Regenerate TF-IDF matrix from the loaded text data using the loaded vectorizer
-    global tfidf_matrix # Declare global to modify
+    get_db_connection()
+    product_texts = load_product_metadata_from_db() # load_product_metadata_from_db already returns texts
+    global tfidf_matrix
     if product_texts and vectorizer:
         try:
-            # Transform the text data loaded from the DB into a new TF-IDF matrix
             tfidf_matrix = vectorizer.transform(product_texts)
             print(f"Regenerated TF-IDF matrix with shape: {tfidf_matrix.shape}")
         except Exception as e:
-            print(f"Error regenerating TF-IDF matrix: {e}")
-            tfidf_matrix = None # Set to None if regeneration fails
-            # If tfidf_matrix is None, search and item recommendations will likely fail later.
-            # You might want to add checks in endpoints for tfidf_matrix being None.
+            print(f"Error regenerating TF-IDF matrix during startup: {e}")
+            tfidf_matrix = None
 
 
 # Optional: Close connection on shutdown
@@ -252,15 +248,20 @@ def recommend_search(req: SearchRequest):
 
         info = product_data.get(idx, {})
         category_one_hot = np.zeros(NUM_CATEGORIES)
-        category_label_val = info.get("category_label", None)
-        if category_label_val is not None:
+        # MODIFIED: Get category_id from loaded product_data
+        category_id_val = info.get("category_id", None) # Get category_id from product_data
+        if category_id_val is not None:
              try:
-                 category_label = int(category_label_val)
-                 if 0 <= category_label < NUM_CATEGORIES:
+                 # Use category_id directly or map to a label if needed by model
+                 # Assuming category_id directly maps to category_label index 0-9
+                 category_label = int(category_id_val) -1 # Assuming category_id is 1-based, convert to 0-based index
+                 if 0 <= category_label < NUM_CATEGORIES: # Check bounds
                     category_one_hot[category_label] = 1
+                 else:
+                     print(f"Warning: Category ID {category_id_val} out of expected range (1-{NUM_CATEGORIES}) for index {idx}. One-hot vector will be zeros.")
              except (ValueError, TypeError):
-                 print(f"Warning: Could not process category_label '{category_label_val}' for index {idx}.")
-                 pass
+                 print(f"Warning: Could not process category ID '{category_id_val}' for index {idx}.")
+                 pass # Keep category_one_hot as zeros if conversion fails
 
         expected_input_dim = model_search.input_shape[-1]
         tfidf_len = expected_input_dim - NUM_CATEGORIES
@@ -396,3 +397,28 @@ def recommend_item(req: ItemRequest):
             product_price=info.get("product_price"),
         ))
     return RecommendationResponse(recommendations=recs)
+
+# --- NEW MANUAL DATA REFRESH ENDPOINT ---
+@app.post("/refresh_data")
+async def refresh_data_endpoint():
+    """Manually triggers data reload from DB and regenerates TF-IDF matrix."""
+    print("Received request to refresh data.")
+    product_texts = load_product_metadata_from_db() # Reload data from DB
+
+    global tfidf_matrix
+    if product_texts and vectorizer:
+        try:
+            tfidf_matrix = vectorizer.transform(product_texts)
+            print(f"Successfully regenerated TF-IDF matrix with shape: {tfidf_matrix.shape}")
+            return {"message": "Data refreshed successfully!", "loaded_items": len(product_data)}
+        except Exception as e:
+            print(f"Error regenerating TF-IDF matrix during refresh: {e}")
+            tfidf_matrix = None # Set to None if regeneration fails
+            raise HTTPException(status_code=500, detail=f"Failed to regenerate TF-IDF matrix: {e}")
+    elif not product_texts:
+         print("No product data loaded from database.")
+         raise HTTPException(status_code=500, detail="No product data loaded from database.")
+    else: # vectorizer is None
+         print("Vectorizer not loaded, cannot regenerate TF-IDF.")
+         raise HTTPException(status_code=500, detail="Vectorizer not available, cannot regenerate TF-IDF matrix.")
+# --- END NEW MANUAL DATA REFRESH ENDPOINT ---
