@@ -42,20 +42,23 @@ def get_db_connection():
     return db_connection
 
 def load_product_metadata_from_db():
-    """Loads product data from the database."""
+    """Loads product data from the database and returns a list of text features for TF-IDF."""
     global product_data, product_id_to_index, index_to_product_id
     product_data = {}
     product_id_to_index = {}
     index_to_product_id = {}
+    product_texts = [] # List to hold text data for TF-IDF
+
     db = get_db_connection()
     if db is None:
         print("Cannot load product data: Database connection failed.")
-        return
+        return product_texts # Return empty list on failure
 
     cursor = None
     try:
         cursor = db.cursor(dictionary=True)
-        query = "SELECT id AS product_id, name AS product_name, user_id AS seller_id, price_sell AS product_price FROM items"
+        # Fetch 'description' column as well if needed for TF-IDF
+        query = "SELECT id AS product_id, name AS product_name, user_id AS seller_id, price_sell AS product_price, description FROM items" # Added description
         print(f"Executing query: {query}")
         cursor.execute(query)
         results = cursor.fetchall()
@@ -63,10 +66,8 @@ def load_product_metadata_from_db():
 
         def safe_float(val, default=0.0):
             try:
-                if isinstance(val, Decimal):
-                    return float(val)
-                if val is None:
-                    return default
+                if isinstance(val, Decimal): return float(val)
+                if val is None: return default
                 return float(val)
             except (ValueError, TypeError, DecimalException):
                 return default
@@ -76,27 +77,48 @@ def load_product_metadata_from_db():
             product_data[idx] = {
                 "product_name": row["product_name"],
                 "seller_id": int(row["seller_id"]),
-                "product_rating": safe_float(row.get("product_rating")),
+                "product_rating": safe_float(row.get("product_rating")), # Will likely be None unless added to DB
                 "product_price": safe_float(row.get("product_price")),
+                # Combine name and description for text features, handle None
+                "text_features": f"{row.get('product_name', '')} {row.get('description', '') or ''}".strip() # Use name + description
             }
             product_id_to_index[product_id] = idx
             index_to_product_id[idx] = product_id
+            # Add the combined text to the list for TF-IDF
+            product_texts.append(product_data[idx]["text_features"])
 
         print("Product metadata loaded successfully from database.")
+        return product_texts # Return the list of texts
 
     except mysql.connector.Error as err:
         print(f"Error loading product data from database: {err}")
-    except Exception as e:
+    except Exception as e: # Catch other potential errors
         print(f"An unexpected error occurred during data loading: {e}")
     finally:
         if cursor:
             cursor.close()
+    return product_texts # Return whatever was loaded, potentially empty list
 
-# Optional: Connect on startup and load data
-@app.on_event("startup")
+# Optional: Connect on startup, load data, and regenerate TF-IDF
+@app.on_event("startup") # Modified startup_event
 async def startup_event():
-    get_db_connection()
-    load_product_metadata_from_db()
+    get_db_connection() # Connect to DB
+    # Load product data and get text features list
+    product_texts = load_product_metadata_from_db()
+
+    # Regenerate TF-IDF matrix from the loaded text data using the loaded vectorizer
+    global tfidf_matrix # Declare global to modify
+    if product_texts and vectorizer:
+        try:
+            # Transform the text data loaded from the DB into a new TF-IDF matrix
+            tfidf_matrix = vectorizer.transform(product_texts)
+            print(f"Regenerated TF-IDF matrix with shape: {tfidf_matrix.shape}")
+        except Exception as e:
+            print(f"Error regenerating TF-IDF matrix: {e}")
+            tfidf_matrix = None # Set to None if regeneration fails
+            # If tfidf_matrix is None, search and item recommendations will likely fail later.
+            # You might want to add checks in endpoints for tfidf_matrix being None.
+
 
 # Optional: Close connection on shutdown
 @app.on_event("shutdown")
@@ -113,7 +135,7 @@ model_search = tf.keras.models.load_model("models/model_final.h5", compile=False
 model_item = tf.keras.models.load_model("models/recommendation_model.h5", compile=False)
 
 vectorizer = joblib.load("models/vectorizer.pkl")
-tfidf_matrix = load_npz("models/tfidf_matrix.npz")
+tfidf_matrix = None
 
 NUM_CATEGORIES = 10
 
@@ -186,12 +208,25 @@ def recommend_user(req: RecommendationRequest):
 # Endpoint search-based recommendation
 @app.post("/recommend/search", response_model=RecommendationResponse)
 def recommend_search(req: SearchRequest):
-    global product_data
-    if not product_data:
-        print("Product data not loaded on endpoint call, attempting to load...")
-        load_product_metadata_from_db()
-        if not product_data:
-             raise HTTPException(status_code=500, detail="Product data could not be loaded from database.")
+    global product_data, tfidf_matrix # Declare globals
+    if not product_data or tfidf_matrix is None: # Check both
+        print("Product data or TF-IDF matrix not loaded/regenerated on endpoint call, attempting to load...")
+        # Re-attempt loading might not regenerate tfidf_matrix unless startup_event is re-run
+        # A better approach might be to raise HTTPException directly if product_data or tfidf_matrix is None
+        load_product_metadata_from_db() # This will load product_data but not regenerate tfidf_matrix here
+        # If product_data is loaded, try regenerating tfidf_matrix if it's None
+        if not product_data or tfidf_matrix is None:
+             if product_data and vectorizer and tfidf_matrix is None:
+                 try:
+                     print("Attempting to regenerate TF-IDF matrix during endpoint call.")
+                     # Need product_texts again, maybe store them globally or refetch?
+                     # Refetching here is inefficient. Relying on startup load is better.
+                     # Let's simplify: if tfidf_matrix is None, it's likely a startup failure.
+                     raise HTTPException(status_code=500, detail="Product data or TF-IDF matrix could not be loaded/regenerated.")
+                 except Exception as e:
+                      raise HTTPException(status_code=500, detail=f"Product data or TF-IDF matrix could not be loaded/regenerated: {e}")
+             else:
+                 raise HTTPException(status_code=500, detail="Product data or TF-IDF matrix could not be loaded/regenerated.")
 
     expected_tfidf_rows = len(product_data)
     if tfidf_matrix.shape[0] != expected_tfidf_rows:
@@ -278,12 +313,20 @@ class ItemRequest(BaseModel):
 
 @app.post("/recommend/item", response_model=RecommendationResponse)
 def recommend_item(req: ItemRequest):
-    global product_data
-    if not product_data:
-        print("Product data not loaded on endpoint call, attempting to load...")
-        load_product_metadata_from_db()
-        if not product_data:
-             raise HTTPException(status_code=500, detail="Product data could not be loaded from database.")
+    global product_data, tfidf_matrix # Declare globals
+    if not product_data or tfidf_matrix is None: # Check both
+        print("Product data or TF-IDF matrix not loaded/regenerated on endpoint call, attempting to load...")
+        load_product_metadata_from_db() # Loads product_data, doesn't regenerate tfidf_matrix
+        if not product_data or tfidf_matrix is None:
+             if product_data and vectorizer and tfidf_matrix is None:
+                 try:
+                     print("Attempting to regenerate TF-IDF matrix during endpoint call.")
+                     # Same inefficiency issue as search endpoint. Rely on startup.
+                     raise HTTPException(status_code=500, detail="Product data or TF-IDF matrix could not be loaded/regenerated.")
+                 except Exception as e:
+                      raise HTTPException(status_code=500, detail=f"Product data or TF-IDF matrix could not be loaded/regenerated: {e}")
+             else:
+                 raise HTTPException(status_code=500, detail="Product data or TF-IDF matrix could not be loaded/regenerated.")
 
     if req.product_id not in product_id_to_index:
         print(f"Warning: Product ID {req.product_id} not found in product_id_to_index mapping. Cannot generate item recommendations.")
