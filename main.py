@@ -16,12 +16,14 @@ import random
 import hashlib
 # Add SQLAlchemy imports
 from sqlalchemy import create_engine, text
+import joblib
+from scipy.sparse import load_npz
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Smart Recommendation System", version="5.3.0")
+app = FastAPI(title="Smart Recommendation System", version="6.0.0")
 
 # Database Configuration
 DB_CONFIG = {
@@ -37,19 +39,50 @@ CATEGORY_MAP = {
     1: {
         "name": "Masak",
         "keywords": ["masak", "dapur", "telenan", "talenan", "panci", "wajan", "spatula", 
-                    "blender", "kompor", "kulkas", "pisau", "sendok", "resep", "makanan", "cooking"]
+                     "blender", "kompor", "kulkas", "pisau", "sendok", "resep", "makanan", "cooking"]
     },
     2: {
         "name": "Fotografi", 
         "keywords": ["fotografi", "kamera", "camera", "foto", "lensa", "tripod", "flash",
-                    "canon", "nikon", "sony", "portrait", "landscape", "editing", "photography"]
+                     "canon", "nikon", "sony", "portrait", "landscape", "editing", "photography"]
     },
     3: {
         "name": "Membaca",
         "keywords": ["membaca", "buku", "novel", "komik", "majalah", "ebook", "reading",
-                    "literature", "fiction", "textbook", "author", "writer", "book"]
+                     "literature", "fiction", "textbook", "author", "writer", "book"]
     }
 }
+
+# Load models and data
+model_user = tf.keras.models.load_model("models/model.h5", compile=False)
+model_search = tf.keras.models.load_model("models/model_final.h5", compile=False)
+model_item = tf.keras.models.load_model("models/recommendation_model.h5", compile=False)
+vectorizer = joblib.load("models/vectorizer.pkl")
+tfidf_matrix = load_npz("models/tfidf_matrix.npz")
+df = pd.read_csv("models/all_dataset.csv").reset_index(drop=True)
+
+product_data = {}
+product_id_to_index = {}
+index_to_product_id = {}
+
+def safe_float(val, default=0.0):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+for idx, row in df.iterrows():
+    product_id = int(row["product_id"])
+    product_data[idx] = {
+        "product_name": row["product_name"],
+        "seller_id": int(row["seller_id"]),
+        "product_rating": safe_float(row.get("product_rating")),
+        "product_price": safe_float(row.get("product_price")),
+    }
+    product_id_to_index[product_id] = idx
+    index_to_product_id[idx] = product_id
+
+NUM_CATEGORIES = 10
 
 class ModelManager:
     """Manages pre-trained models"""
@@ -77,7 +110,6 @@ class ModelManager:
                 self.model_item = tf.keras.models.load_model("models/recommendation_model.h5", compile=False)
                 logger.info("✅ Item model loaded")
             
-            # Generate user similarity matrix
             self._generate_user_similarity_matrix()
             
             self.models_loaded = True
@@ -97,7 +129,6 @@ class ModelManager:
                 logger.warning("Cannot generate user similarity matrix: No database connection")
                 return
             
-            # Get all users and their purchases
             query = """
             SELECT 
                 t.buyer_id as user_id,
@@ -113,13 +144,9 @@ class ModelManager:
                 logger.warning("No transaction data found for similarity matrix")
                 return
             
-            # Create user-item matrix (1 if user bought item, 0 otherwise)
             user_item_matrix = pd.crosstab(df['user_id'], df['item_id'])
-            
-            # Fill NaN with 0
             user_item_matrix = user_item_matrix.fillna(0)
             
-            # Calculate cosine similarity between users
             if len(user_item_matrix) > 1:
                 self.user_similarity_matrix = pd.DataFrame(
                     cosine_similarity(user_item_matrix),
@@ -138,22 +165,15 @@ class ModelManager:
     def get_similar_users(self, user_id, top_n=5):
         """Get similar users based on similarity matrix"""
         if self.user_similarity_matrix is None or user_id not in self.user_similarity_matrix.index:
-            # Fallback to database query if no matrix or user not in matrix
             return DatabaseManager.get_similar_users(user_id, top_n)
         
-        # Get similarity scores for this user
         user_similarities = self.user_similarity_matrix.loc[user_id].sort_values(ascending=False)
-        
-        # Remove self-similarity
         user_similarities = user_similarities[user_similarities.index != user_id]
-        
-        # Get top similar users
         top_similar = user_similarities.head(top_n)
         
-        # Convert to DataFrame
         result = pd.DataFrame({
             'similar_user_id': top_similar.index,
-            'common_items': top_similar.values * 10  # Scale up for compatibility
+            'common_items': top_similar.values * 10
         })
         
         logger.info(f"Found {len(result)} similar users for user {user_id} using similarity matrix")
@@ -168,15 +188,36 @@ class ModelManager:
                 logger.error(f"User model prediction failed: {e}")
         return None
     
+    def get_item_embeddings(self, item_indices: np.ndarray) -> Optional[np.ndarray]:
+        """Generate embeddings for given item indices using model_item.
+        FIX: Use TF-IDF vector as input if model_item expects vector, not just index.
+        """
+        if self.model_item and self.models_loaded:
+            try:
+                # --- FIX: Use TF-IDF vector as input, not just index ---
+                # item_indices: list of row indices in self.products_df
+                # Ambil TF-IDF vector untuk semua produk
+                tfidf_all = tfidf_matrix.toarray()
+                # Pastikan shape sesuai input model_item
+                input_dim = self.model_item.input_shape[-1]
+                if tfidf_all.shape[1] > input_dim:
+                    tfidf_all = tfidf_all[:, :input_dim]
+                elif tfidf_all.shape[1] < input_dim:
+                    tfidf_all = np.pad(tfidf_all, ((0,0),(0,input_dim-tfidf_all.shape[1])), mode='constant')
+                # Ambil hanya baris yang diminta
+                input_data = tfidf_all[item_indices]
+                embeddings = self.model_item.predict(input_data, verbose=0)
+                logger.info(f"✅ Generated embeddings for {len(item_indices)} items (TF-IDF input).")
+                return embeddings
+            except Exception as e:
+                logger.error(f"Item model prediction (get_item_embeddings) failed: {e}")
+        return None
+
     def refresh_models(self):
         """Refresh all models and similarity matrix"""
         try:
-            # Reload models
             success = self.load_models()
-            
-            # Regenerate similarity matrix
             self._generate_user_similarity_matrix()
-            
             self.last_refresh = datetime.now()
             return success
         except Exception as e:
@@ -189,15 +230,12 @@ class DatabaseManager:
     @staticmethod
     def get_connection_string():
         """Get SQLAlchemy connection string"""
-        # Configure your database connection here
         db_config = {
             'host': os.environ.get('DB_HOST', 'localhost'),
             'user': os.environ.get('DB_USER', 'root'),
             'password': os.environ.get('DB_PASSWORD', ''),
             'database': os.environ.get('DB_NAME', 'pinjemin')
         }
-        
-        # Create SQLAlchemy connection string
         return f"mysql+mysqlconnector://{db_config['user']}:{db_config['password']}@{db_config['host']}/{db_config['database']}"
     
     @staticmethod
@@ -343,7 +381,6 @@ class DatabaseManager:
             if not engine:
                 return pd.DataFrame()
                 
-            # Find users who purchased similar items
             query = """
             SELECT 
                 t2.buyer_id as similar_user_id,
@@ -376,14 +413,12 @@ class FastSemanticEngine:
         """Fit semantic engine with optimizations"""
         self.products_df = products_df.copy()
         
-        # Create search text with category keywords
         self.products_df['search_text'] = (
             self.products_df['product_name'].fillna('').astype(str) + ' ' +
             self.products_df['description'].fillna('').astype(str) + ' ' +
             self.products_df['category_id'].apply(self._get_category_keywords)
         )
         
-        # Optimized TF-IDF
         self.tfidf_vectorizer = TfidfVectorizer(
             max_features=500,
             ngram_range=(1, 2),
@@ -406,49 +441,44 @@ class FastSemanticEngine:
         return self.category_cache[category_id]
     
     def search(self, query, top_n=10, exclude_seller_id=None):
-        """Fast semantic search with guaranteed 10 results"""
+        """Fast semantic search with guaranteed 10 results, only available products."""
         if not self.tfidf_vectorizer or self.tfidf_matrix.shape[0] == 0:
             return self._fallback_search(top_n, exclude_seller_id)
         
-        # Preprocess query
         processed_query = self._preprocess_query(query)
-        
-        # Calculate similarities
         query_vector = self.tfidf_vectorizer.transform([processed_query])
         similarities = cosine_similarity(query_vector, self.tfidf_matrix).flatten()
-        
-        # Get all results sorted by similarity
         all_indices = similarities.argsort()[::-1]
-        
+
+        # --- FILTER ONLY AVAILABLE PRODUCTS ---
+        available_ids = set(self.products_df[self.products_df.get('status', 'available').str.lower() == 'available']['product_id'].tolist()) \
+            if 'status' in self.products_df.columns else set(self.products_df['product_id'].tolist())
+
         results = []
         seen_products = set()
-        
-        # First pass: high similarity results
         for idx in all_indices:
             if len(results) >= top_n:
                 break
-            
             product = self.products_df.iloc[idx]
             product_id = product['product_id']
-            
-            # Skip if this item belongs to the excluded seller
+            # Only available products
+            if product_id not in available_ids:
+                continue
             if exclude_seller_id and product['seller_id'] == exclude_seller_id:
                 continue
-            
             if product_id not in seen_products:
                 seen_products.add(product_id)
                 results.append(self._create_result(product, similarities[idx]))
-        
-        # If not enough results, add category-based results
         if len(results) < top_n:
             category_results = self._category_search(query, top_n - len(results), seen_products, exclude_seller_id)
+            # Only available products in fallback
+            category_results = [r for r in category_results if r['product_id'] in available_ids]
             results.extend(category_results)
-        
-        # If still not enough, add popular items
         if len(results) < top_n:
             popular_results = self._popular_search(top_n - len(results), seen_products, exclude_seller_id)
+            # Only available products in fallback
+            popular_results = [r for r in popular_results if r['product_id'] in available_ids]
             results.extend(popular_results)
-        
         return results[:top_n]
     
     def find_similar_by_name(self, product_name, exclude_id=None, top_n=10, exclude_seller_id=None):
@@ -456,11 +486,9 @@ class FastSemanticEngine:
         if not self.tfidf_vectorizer or self.tfidf_matrix.shape[0] == 0:
             return []
         
-        # Create query from product name
         query_vector = self.tfidf_vectorizer.transform([product_name])
         similarities = cosine_similarity(query_vector, self.tfidf_matrix).flatten()
         
-        # Get top similar items
         top_indices = similarities.argsort()[::-1]
         
         results = []
@@ -472,11 +500,10 @@ class FastSemanticEngine:
             if exclude_id and product['product_id'] == exclude_id:
                 continue
                 
-            # Skip if this item belongs to the excluded seller
             if exclude_seller_id and product['seller_id'] == exclude_seller_id:
                 continue
                 
-            if similarities[idx] > 0.1:  # Minimum similarity threshold
+            if similarities[idx] > 0.1:
                 results.append(self._create_result(product, similarities[idx]))
         
         return results
@@ -485,7 +512,6 @@ class FastSemanticEngine:
         """Quick query preprocessing"""
         query = query.lower().strip()
         
-        # Simple typo corrections
         corrections = {
             'telenan': 'talenan cutting board masak dapur',
             'talenan': 'telenan cutting board masak dapur',
@@ -522,9 +548,8 @@ class FastSemanticEngine:
                 break
                 
             category_filter = (self.products_df['category_id'] == category_id) & \
-                            (~self.products_df['product_id'].isin(seen_products))
+                              (~self.products_df['product_id'].isin(seen_products))
             
-            # Add seller exclusion filter
             if exclude_seller_id:
                 category_filter = category_filter & (self.products_df['seller_id'] != exclude_seller_id)
                 
@@ -542,7 +567,6 @@ class FastSemanticEngine:
         
         available_filter = ~self.products_df['product_id'].isin(seen_products)
         
-        # Add seller exclusion filter
         if exclude_seller_id:
             available_filter = available_filter & (self.products_df['seller_id'] != exclude_seller_id)
             
@@ -575,7 +599,6 @@ class FastSemanticEngine:
         
         available_filter = pd.Series([True] * len(self.products_df))
         
-        # Add seller exclusion filter
         if exclude_seller_id:
             available_filter = available_filter & (self.products_df['seller_id'] != exclude_seller_id)
             
@@ -602,19 +625,15 @@ class SmartRecommendationEngine:
         try:
             logger.info("Initializing recommendation engine...")
             
-            # Load models first
             self.model_manager.load_models()
             
-            # Load data from database
             self.products_df = DatabaseManager.load_available_items()
             if self.products_df.empty:
                 logger.error("No products found in database!")
                 return False
             
-            # Initialize semantic search
             self.semantic_engine.fit(self.products_df)
             
-            # Pre-calculate item similarities for faster recommendations
             self._precalculate_similarities()
             
             self.last_update = datetime.now()
@@ -632,19 +651,15 @@ class SmartRecommendationEngine:
         try:
             logger.info("Refreshing recommendation engine data...")
             
-            # Refresh models
             self.model_manager.refresh_models()
             
-            # Reload products
             self.products_df = DatabaseManager.load_available_items()
             if self.products_df.empty:
                 logger.error("No products found in database after refresh!")
                 return False
             
-            # Re-initialize semantic search
             self.semantic_engine.fit(self.products_df)
             
-            # Re-calculate item similarities
             self._precalculate_similarities()
             
             self.last_update = datetime.now()
@@ -657,17 +672,60 @@ class SmartRecommendationEngine:
             return False
     
     def _precalculate_similarities(self):
-        """Pre-calculate item similarities for faster recommendations"""
+        """Pre-calculate item similarities using model_item embeddings."""
+        try:
+            if self.model_manager.model_item is None:
+                logger.warning("⚠️ model_item not loaded. Falling back to TF-IDF similarity.")
+                self._precalculate_similarities_tfidf_fallback()
+                return
+
+            logger.info("Pre-calculating item similarities using model_item embeddings...")
+            
+            # --- FIX: Use index from 0 to len(products_df)-1 for embedding ---
+            all_product_indices = list(range(len(self.products_df)))
+            if not all_product_indices:
+                logger.error("No valid product indices to process for similarity calculation.")
+                return
+
+            item_embeddings = self.model_manager.get_item_embeddings(all_product_indices)
+
+            if item_embeddings is None or len(item_embeddings) == 0:
+                logger.error("❌ Failed to generate item embeddings. Cannot calculate model-based similarity.")
+                return
+
+            similarity_matrix = cosine_similarity(item_embeddings)
+            
+            matrix_index_to_product_id = {i: self.products_df.iloc[i]['product_id'] for i in all_product_indices}
+
+            for i in range(similarity_matrix.shape[0]):
+                current_product_id = matrix_index_to_product_id[i]
+                
+                similarities = similarity_matrix[i]
+                top_indices = similarities.argsort()[-21:-1][::-1]
+                
+                similar_items = []
+                for sim_idx in top_indices:
+                    similar_product_id = matrix_index_to_product_id[sim_idx]
+                    similar_items.append({
+                        'product_id': similar_product_id,
+                        'similarity_score': float(similarities[sim_idx])
+                    })
+                
+                self.item_similarity_cache[current_product_id] = similar_items
+
+            logger.info(f"✅ Item similarities pre-calculated for {len(self.item_similarity_cache)} items using model_item.")
+
+        except Exception as e:
+            logger.error(f"Error pre-calculating model-based similarities: {e}")
+
+    def _precalculate_similarities_tfidf_fallback(self):
+        """Fallback method to calculate similarity using TF-IDF if model fails."""
         try:
             if self.semantic_engine.tfidf_matrix is not None:
-                # Calculate similarity matrix
                 similarity_matrix = cosine_similarity(self.semantic_engine.tfidf_matrix)
-                
-                # Store top 20 similar items for each product
                 for idx, product_id in enumerate(self.products_df['product_id']):
                     similarities = similarity_matrix[idx]
-                    top_indices = similarities.argsort()[-21:-1][::-1]  # Top 20 (excluding self)
-                    
+                    top_indices = similarities.argsort()[-21:-1][::-1]
                     similar_items = []
                     for sim_idx in top_indices:
                         if sim_idx != idx:
@@ -676,36 +734,28 @@ class SmartRecommendationEngine:
                                 'product_id': similar_product_id,
                                 'similarity_score': float(similarities[sim_idx])
                             })
-                    
                     self.item_similarity_cache[product_id] = similar_items
-                
-                logger.info("Item similarities pre-calculated")
+                logger.info("✅ Item similarities pre-calculated using TF-IDF fallback.")
         except Exception as e:
-            logger.error(f"Error pre-calculating similarities: {e}")
+            logger.error(f"Error in TF-IDF fallback similarity calculation: {e}")
     
     def get_user_recommendations(self, user_id, top_n=10):
         """Get personalized recommendations for each user using collaborative filtering"""
         try:
-            # Get user's owned items to exclude from recommendations
             user_owned_items = DatabaseManager.get_user_owned_items(user_id)
             
-            # Method 1: Collaborative filtering based on similar users
             similar_users = self.model_manager.get_similar_users(user_id)
             
             if not similar_users.empty:
-                # User has similar users - recommend items purchased by similar users
                 logger.info(f"Found {len(similar_users)} similar users for user {user_id}")
                 return self._get_collaborative_filtering_recommendations(user_id, similar_users, top_n, user_owned_items)
             
-            # Method 2: Check if user has posted items
             user_posted_items = DatabaseManager.get_user_posted_items(user_id)
             
             if not user_posted_items.empty:
-                # User has posted items - recommend similar items
                 logger.info(f"User {user_id} has posted {len(user_posted_items)} items, finding similar items")
                 return self._get_recommendations_from_user_items(user_posted_items, user_id, top_n, user_owned_items)
             else:
-                # Method 3: New user - personalized recommendations based on user_id
                 logger.info(f"User {user_id} is new, generating personalized recommendations")
                 return self._get_personalized_new_user_recommendations(user_id, top_n, user_owned_items)
                 
@@ -716,14 +766,11 @@ class SmartRecommendationEngine:
     def _get_collaborative_filtering_recommendations(self, user_id, similar_users, top_n, user_owned_items):
         """Get recommendations based on similar users' purchases"""
         try:
-            # Get user's purchase history to exclude already purchased items
             user_history = DatabaseManager.get_user_purchase_history(user_id)
             purchased_ids = set(user_history['product_id'].tolist() if not user_history.empty else [])
             
-            # Combine purchased items and owned items for exclusion
             exclude_ids = purchased_ids.union(user_owned_items)
             
-            # Get user's category preferences based on purchase history
             user_category_prefs = {}
             if not user_history.empty:
                 category_counts = user_history['category_id'].value_counts()
@@ -731,14 +778,12 @@ class SmartRecommendationEngine:
                 for category_id, count in category_counts.items():
                     user_category_prefs[category_id] = count / total_purchases
             
-            # Get recommendations from similar users
             recommendations = {}
             
             for _, similar_user in similar_users.iterrows():
                 similar_user_id = similar_user['similar_user_id']
-                similarity_weight = similar_user['common_items'] / 10  # Normalize weight
+                similarity_weight = similar_user['common_items'] / 10
                 
-                # Get items purchased by similar user
                 engine = DatabaseManager.get_engine()
                 if not engine:
                     continue
@@ -763,11 +808,9 @@ class SmartRecommendationEngine:
                 for _, item in similar_user_items.iterrows():
                     product_id = item['product_id']
                     
-                    # Skip if user already purchased this item or owns it
                     if product_id in exclude_ids:
                         continue
                         
-                    # Calculate category boost based on user preferences
                     category_boost = 1.0
                     if user_category_prefs and item['category_id'] in user_category_prefs:
                         category_boost = 1.0 + user_category_prefs[item['category_id']]
@@ -782,37 +825,29 @@ class SmartRecommendationEngine:
                             'description': item['description']
                         }
                     
-                    # Increase score based on similarity weight and category boost
                     recommendations[product_id]['score'] += similarity_weight * category_boost
             
-            # If we have the semantic engine, boost scores based on content similarity
             if self.semantic_engine.tfidf_vectorizer is not None and user_history is not None and not user_history.empty:
                 for product_id, data in recommendations.items():
-                    # Get product info
                     product_info = self.products_df[self.products_df['product_id'] == product_id]
                     if product_info.empty:
                         continue
                     
-                    # Calculate content similarity with user's purchased items
                     content_boost = 0
-                    for _, hist_item in user_history.head(5).iterrows():  # Use last 5 purchases
+                    for _, hist_item in user_history.head(5).iterrows():
                         hist_item_info = self.products_df[self.products_df['product_id'] == hist_item['product_id']]
                         if hist_item_info.empty:
                             continue
                         
-                        # Calculate text similarity between items
                         if 'search_text' in hist_item_info.columns and 'search_text' in product_info.columns:
                             hist_text = hist_item_info['search_text'].iloc[0]
                             prod_text = product_info['search_text'].iloc[0]
                             
-                            # Simple text similarity
                             similarity = SequenceMatcher(None, hist_text, prod_text).ratio()
-                            content_boost += similarity * 0.2  # Weight for content similarity
+                            content_boost += similarity * 0.2
                     
-                    # Add content boost to score
                     recommendations[product_id]['score'] += content_boost
             
-            # Convert to list and sort by score
             results = []
             for product_id, data in sorted(recommendations.items(), key=lambda x: x[1]['score'], reverse=True)[:top_n]:
                 results.append({
@@ -825,7 +860,6 @@ class SmartRecommendationEngine:
                     'category_name': CATEGORY_MAP.get(data['category_id'], {}).get('name', 'Unknown')
                 })
             
-            # If not enough recommendations, fill with content-based items
             if len(results) < top_n:
                 existing_ids = {r['product_id'] for r in results}
                 existing_ids.update(exclude_ids)
@@ -848,7 +882,6 @@ class SmartRecommendationEngine:
             item_name = user_item['product_name']
             item_id = user_item['product_id']
             
-            # Find similar items by name, excluding user's own items
             similar_items = self.semantic_engine.find_similar_by_name(
                 item_name, exclude_id=item_id, top_n=5, exclude_seller_id=user_id
             )
@@ -857,7 +890,6 @@ class SmartRecommendationEngine:
                 product_id = similar_item['product_id']
                 score = similar_item['similarity_score']
                 
-                # Skip if user owns this item
                 if product_id in user_owned_items:
                     continue
                 
@@ -865,13 +897,11 @@ class SmartRecommendationEngine:
                     recommendations[product_id] = 0
                 recommendations[product_id] += score
         
-        # Convert to list and get product details
         results = []
         for product_id, score in sorted(recommendations.items(), key=lambda x: x[1], reverse=True)[:top_n]:
             product_info = self.products_df[self.products_df['product_id'] == product_id]
             if not product_info.empty:
                 product_info = product_info.iloc[0]
-                # Double check that this item doesn't belong to the user
                 if product_info['seller_id'] != user_id:
                     results.append({
                         'product_id': product_id,
@@ -883,7 +913,6 @@ class SmartRecommendationEngine:
                         'category_name': CATEGORY_MAP.get(product_info['category_id'], {}).get('name', 'Unknown')
                     })
         
-        # If not enough recommendations, fill with personalized items
         if len(results) < top_n:
             existing_ids = {r['product_id'] for r in results}
             existing_ids.update(user_owned_items)
@@ -895,51 +924,60 @@ class SmartRecommendationEngine:
         return results[:top_n]
     
     def _get_personalized_new_user_recommendations(self, user_id, top_n, exclude_ids=None):
-        """Get personalized recommendations for new users based on user_id"""
+        """Get personalized recommendations for new users based on the user model."""
         if exclude_ids is None:
             exclude_ids = set()
+
+        logger.info(f"Generating new user recommendations for user {user_id} using model_user.")
         
-        # Use user_id as seed for consistent but different recommendations per user
+        user_preferences = None
+        if self.model_manager.model_user:
+            try:
+                user_features = np.array([user_id]) 
+                predicted_scores = self.model_manager.predict_user_preferences(user_features)
+                
+                if predicted_scores is not None and len(predicted_scores) > 0:
+                    scores = predicted_scores[0]
+                    user_preferences = {i + 1: score for i, score in enumerate(scores)}
+                    logger.info(f"Model-based preferences for user {user_id}: {user_preferences}")
+
+            except Exception as e:
+                logger.error(f"Failed to get preferences from model_user for user {user_id}: {e}")
+                user_preferences = None
+        
+        if user_preferences is None:
+            logger.warning(f"Falling back to hash-based preferences for user {user_id}.")
+            user_preferences = self._generate_user_preference_profile(user_id)
+        
         user_seed = int(hashlib.md5(str(user_id).encode()).hexdigest()[:8], 16)
         random.seed(user_seed)
-        np.random.seed(user_seed % 2147483647)  # Ensure it's within int32 range
-        
-        # Create user preference profile based on user_id
-        user_preferences = self._generate_user_preference_profile(user_id)
-        
+
+        sorted_preferences = sorted(user_preferences.items(), key=lambda item: item[1], reverse=True)
+
         results = []
         
-        # Get items from preferred categories with some randomization
-        for category_id, preference_score in user_preferences.items():
+        for category_id, preference_score in sorted_preferences:
             if len(results) >= top_n:
                 break
-                
-            # Number of items from this category based on preference
-            items_from_category = max(1, int((top_n // 3) * preference_score))
+            
+            items_from_category = max(1, int(np.ceil(top_n * preference_score)))
             
             category_products = self.products_df[
                 (self.products_df['category_id'] == category_id) &
                 (~self.products_df['product_id'].isin(exclude_ids)) &
-                (self.products_df['seller_id'] != user_id)  # Exclude user's own items
+                (self.products_df['seller_id'] != user_id)
             ]
             
-            if len(category_products) > 0:
-                # Randomly sample from this category (but consistent per user)
+            if not category_products.empty:
                 sample_size = min(items_from_category, len(category_products))
                 sampled_products = category_products.sample(n=sample_size, random_state=user_seed)
                 
                 for _, product in sampled_products.iterrows():
-                    if len(results) >= top_n:
-                        break
-                        
-                    # Add some randomness to similarity score based on preference
-                    base_score = 0.5 + (preference_score * 0.3)
-                    noise = np.random.uniform(-0.1, 0.1)
-                    final_score = max(0.1, min(1.0, base_score + noise))
+                    if len(results) >= top_n: break
                     
                     results.append({
                         'product_id': product['product_id'],
-                        'similarity_score': final_score,
+                        'similarity_score': float(preference_score),
                         'product_name': product['product_name'],
                         'category_id': product['category_id'],
                         'price': product['price'],
@@ -947,12 +985,11 @@ class SmartRecommendationEngine:
                         'category_name': CATEGORY_MAP.get(product['category_id'], {}).get('name', 'Unknown')
                     })
                     exclude_ids.add(product['product_id'])
-        
-        # Fill remaining slots with random items if needed
+
         if len(results) < top_n:
             remaining_products = self.products_df[
                 (~self.products_df['product_id'].isin(exclude_ids)) &
-                (self.products_df['seller_id'] != user_id)  # Exclude user's own items
+                (self.products_df['seller_id'] != user_id)
             ]
             
             if len(remaining_products) > 0:
@@ -971,23 +1008,17 @@ class SmartRecommendationEngine:
                         'category_name': CATEGORY_MAP.get(product['category_id'], {}).get('name', 'Unknown')
                     })
         
-        # Reset random seed
         random.seed()
-        np.random.seed()
-        
         return results[:top_n]
     
     def _generate_user_preference_profile(self, user_id):
         """Generate consistent user preference profile based on user_id"""
-        # Use user_id to generate consistent preferences
         user_hash = hashlib.md5(str(user_id).encode()).hexdigest()
         
-        # Extract preference values from hash
-        pref1 = int(user_hash[0:2], 16) / 255.0  # 0-1
-        pref2 = int(user_hash[2:4], 16) / 255.0  # 0-1
-        pref3 = int(user_hash[4:6], 16) / 255.0  # 0-1
+        pref1 = int(user_hash[0:2], 16) / 255.0
+        pref2 = int(user_hash[2:4], 16) / 255.0
+        pref3 = int(user_hash[4:6], 16) / 255.0
         
-        # Normalize so they sum to 1
         total = pref1 + pref2 + pref3
         if total > 0:
             pref1 /= total
@@ -997,88 +1028,74 @@ class SmartRecommendationEngine:
             pref1 = pref2 = pref3 = 1/3
         
         return {
-            1: pref1,  # Masak
-            2: pref2,  # Fotografi
-            3: pref3   # Membaca
+            1: pref1,
+            2: pref2,
+            3: pref3
         }
     
     def get_item_recommendations(self, product_id, user_id, top_n=10):
-        """Get similar items using pre-calculated cache"""
+        """Get similar items using pre-calculated cache, prioritize same category as the clicked product, only available products."""
         try:
-            # Get user's owned items to exclude from recommendations
             user_owned_items = DatabaseManager.get_user_owned_items(user_id)
-            
-            if product_id in self.item_similarity_cache:
-                similar_items = self.item_similarity_cache[product_id][:top_n * 2]  # Get more to filter
-                
-                results = []
-                for item in similar_items:
-                    if len(results) >= top_n:
-                        break
-                        
-                    # Skip if user owns this item
-                    if item['product_id'] in user_owned_items:
-                        continue
-                        
-                    product_info = self.products_df[self.products_df['product_id'] == item['product_id']]
-                    if not product_info.empty:
-                        product_info = product_info.iloc[0]
-                        
-                        # Skip if this item belongs to the user
-                        if product_info['seller_id'] == user_id:
-                            continue
-                            
-                        results.append({
-                            'product_id': item['product_id'],
-                            'similarity_score': item['similarity_score'],
-                            'product_name': product_info['product_name'],
-                            'category_id': product_info['category_id'],
-                            'price': product_info['price'],
-                            'seller_id': product_info['seller_id'],
-                            'category_name': CATEGORY_MAP.get(product_info['category_id'], {}).get('name', 'Unknown')
-                        })
-                
-                # If not enough results, fill with category-based recommendations
-                if len(results) < top_n:
-                    existing_ids = {r['product_id'] for r in results}
-                    existing_ids.update(user_owned_items)
-                    
-                    product_info = self.products_df[self.products_df['product_id'] == product_id]
-                    if not product_info.empty:
-                        category_id = product_info.iloc[0]['category_id']
-                        additional_items = self._get_category_recommendations(category_id, product_id, top_n - len(results), user_id, existing_ids)
-                        results.extend(additional_items)
-                
-                return results[:top_n]
-            else:
-                # Fallback to category-based recommendations
-                product_info = self.products_df[self.products_df['product_id'] == product_id]
-                if not product_info.empty:
-                    category_id = product_info.iloc[0]['category_id']
-                    return self._get_category_recommendations(category_id, product_id, top_n, user_id, user_owned_items)
-                
+            product_info = self.products_df[self.products_df['product_id'] == product_id]
+            if product_info.empty:
                 return self._get_personalized_new_user_recommendations(user_id, top_n, user_owned_items)
-                
+            clicked_category = product_info.iloc[0]['category_id']
+            # Only available products
+            available_ids = set(self.products_df[self.products_df.get('status', 'available').str.lower() == 'available']['product_id'].tolist()) \
+                if 'status' in self.products_df.columns else set(self.products_df['product_id'].tolist())
+
+            if product_id in self.item_similarity_cache:
+                similar_items = self.item_similarity_cache[product_id][:top_n * 5]
+                filtered_items = []
+                for item in similar_items:
+                    if len(filtered_items) >= top_n:
+                        break
+                    if item['product_id'] in user_owned_items or item['product_id'] not in available_ids:
+                        continue
+                    prod_info = self.products_df[self.products_df['product_id'] == item['product_id']]
+                    if not prod_info.empty:
+                        prod_info = prod_info.iloc[0]
+                        if prod_info['seller_id'] == user_id:
+                            continue
+                        if prod_info['category_id'] == clicked_category:
+                            filtered_items.append({
+                                'product_id': item['product_id'],
+                                'similarity_score': item['similarity_score'],
+                                'product_name': prod_info['product_name'],
+                                'category_id': prod_info['category_id'],
+                                'price': prod_info['price'],
+                                'seller_id': prod_info['seller_id'],
+                                'category_name': CATEGORY_MAP.get(prod_info['category_id'], {}).get('name', 'Unknown')
+                            })
+                if len(filtered_items) < top_n:
+                    existing_ids = {r['product_id'] for r in filtered_items}
+                    existing_ids.update(user_owned_items)
+                    additional_items = self._get_category_recommendations(
+                        clicked_category, product_id, top_n - len(filtered_items), user_id, existing_ids, available_ids
+                    )
+                    filtered_items.extend(additional_items)
+                return filtered_items[:top_n]
+            else:
+                return self._get_category_recommendations(clicked_category, product_id, top_n, user_id, user_owned_items, available_ids)
         except Exception as e:
             logger.error(f"Error in item recommendations: {e}")
             return self._get_personalized_new_user_recommendations(user_id, top_n, set())
-    
-    def search_recommendations(self, query, user_id, top_n=10):
-        """Get search recommendations - always returns 10 items"""
-        return self.semantic_engine.search(query, top_n, exclude_seller_id=user_id)
-    
-    def _get_category_recommendations(self, category_id, exclude_product_id, top_n, user_id, exclude_ids=None):
-        """Get recommendations from same category"""
+
+    def _get_category_recommendations(self, category_id, exclude_product_id, top_n, user_id, exclude_ids=None, available_ids=None):
+        """Get recommendations from same category, only available products."""
         if exclude_ids is None:
             exclude_ids = set()
-            
+        if available_ids is None:
+            available_ids = set(self.products_df[self.products_df.get('status', 'available').str.lower() == 'available']['product_id'].tolist()) \
+                if 'status' in self.products_df.columns else set(self.products_df['product_id'].tolist())
         category_products = self.products_df[
             (self.products_df['category_id'] == category_id) &
             (self.products_df['product_id'] != exclude_product_id) &
             (~self.products_df['product_id'].isin(exclude_ids)) &
-            (self.products_df['seller_id'] != user_id)  # Exclude user's own items
+            (self.products_df['seller_id'] != user_id) &
+            (self.products_df['product_id'].isin(available_ids))
         ].head(top_n)
-        
         results = []
         for _, product in category_products.iterrows():
             results.append({
@@ -1090,25 +1107,24 @@ class SmartRecommendationEngine:
                 'seller_id': product['seller_id'],
                 'category_name': CATEGORY_MAP.get(product['category_id'], {}).get('name', 'Unknown')
             })
-        
         return results
 
 # Global engine instance
 engine = SmartRecommendationEngine()
 
-# Pydantic models - KEMBALI KE REQUIRED user_id
+# Pydantic models
 class RecommendationRequest(BaseModel):
     user_id: int
     top_n: int = 10
 
 class SearchRequest(BaseModel):
     keyword: str
-    user_id: int  # ✅ Required lagi
+    user_id: int
     top_n: int = 10
 
 class ItemRequest(BaseModel):
     product_id: int
-    user_id: int  # ✅ Required lagi
+    user_id: int
     top_n: int = 10
 
 class ProductRecommendation(BaseModel):
@@ -1152,113 +1168,163 @@ async def refresh_data():
 
 @app.post("/recommend/user", response_model=RecommendationResponse)
 def recommend_user(req: RecommendationRequest):
-    """Get personalized user recommendations"""
+    logger.info(f"Received /recommend/user request: {req}")
     try:
         if not engine.is_initialized:
             engine.initialize()
-        
         recommendations_data = engine.get_user_recommendations(req.user_id, req.top_n)
-        
         recommendations = []
         for rec in recommendations_data:
             recommendations.append(ProductRecommendation(
-                product_id=rec['product_id'],
-                product_name=rec['product_name'],
-                seller_id=rec['seller_id'],
-                product_price=rec['price'],
-                similarity_score=rec['similarity_score'],
-                category_id=rec['category_id'],
-                category_name=rec['category_name'],
-                recommendation_reason=f"Personalized for user {req.user_id} (score: {rec['similarity_score']:.3f})"
+                product_id=rec.get('product_id', 0),
+                product_name=rec.get('product_name', ''),
+                seller_id=rec.get('seller_id', 0),
+                product_price=rec.get('price', 0.0),
+                similarity_score=rec.get('similarity_score', 0.0),
+                category_id=rec.get('category_id', 0),
+                category_name=rec.get('category_name', ''),
+                recommendation_reason=f"Personalized for user {req.user_id} (score: {rec.get('similarity_score', 0.0):.3f})"
             ))
-        
+        logger.info(f"Returning {len(recommendations)} recommendations for user {req.user_id}")
         return RecommendationResponse(
             recommendations=recommendations,
             total_found=len(recommendations),
-            algorithm_used="personalized_user_based_exclude_owned",
+            algorithm_used="hybrid_model_based_recommendation",
             query_info=f"User {req.user_id} - personalized recommendations (excluding owned items)"
         )
-        
     except Exception as e:
         logger.error(f"Error in user recommendations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/recommend/search", response_model=RecommendationResponse)
 def recommend_search(req: SearchRequest):
-    """Get search recommendations - always returns 10 items"""
+    logger.info(f"Received /recommend/search request: {req}")
     try:
         if not engine.is_initialized:
             engine.initialize()
-        
-        recommendations_data = engine.search_recommendations(req.keyword, req.user_id, 10)
-        
+        # --- FIX: panggil method semantic_engine.search, bukan engine.search_recommendations ---
+        semantic_results = engine.semantic_engine.search(req.keyword, 80, exclude_seller_id=req.user_id)
+        query_lower = req.keyword.lower()
+        category_scores = {}
+        for cat_id, cat_info in CATEGORY_MAP.items():
+            score = sum(1 for kw in cat_info['keywords'] if kw in query_lower)
+            if score > 0:
+                category_scores[cat_id] = score
+        target_category = max(category_scores, key=category_scores.get) if category_scores else None
+
+        hasil = []
+        for rec in semantic_results:
+            # --- FILTER: hanya tampilkan produk dengan kategori yang sama dengan target_category ---
+            if target_category and rec.get('category_id', 0) != target_category:
+                continue
+            idx = None
+            if hasattr(engine, "products_df"):
+                df = engine.products_df
+                idxs = df.index[df['product_id'] == rec['product_id']].tolist()
+                if idxs:
+                    idx = idxs[0]
+            if idx is None:
+                continue
+
+            if hasattr(engine.semantic_engine, "tfidf_matrix"):
+                produk_tfidf_vec = engine.semantic_engine.tfidf_matrix[idx].toarray().flatten()
+            else:
+                produk_tfidf_vec = np.zeros(500)
+
+            category_id = rec.get('category_id', 0)
+            NUM_CATEGORIES = 10
+            category_one_hot = np.zeros(NUM_CATEGORIES)
+            if 0 < category_id <= NUM_CATEGORIES:
+                category_one_hot[category_id-1] = 1
+
+            expected_input_dim = model_search.input_shape[-1]
+            tfidf_len = expected_input_dim - NUM_CATEGORIES
+            if len(produk_tfidf_vec) > tfidf_len:
+                produk_tfidf_vec = produk_tfidf_vec[:tfidf_len]
+            elif len(produk_tfidf_vec) < tfidf_len:
+                produk_tfidf_vec = np.pad(produk_tfidf_vec, (0, tfidf_len - len(produk_tfidf_vec)), mode='constant')
+            
+            x_input = np.concatenate([category_one_hot, produk_tfidf_vec]).reshape(1, -1)
+            if x_input.shape[1] != expected_input_dim:
+                continue
+            prob = float(model_search.predict(x_input, verbose=0)[0][0])
+
+            hasil.append((prob, rec))
+
+        hasil_sorted = sorted(hasil, key=lambda x: x[0], reverse=True)
+        top_n = req.top_n
+        top_k = min(2, top_n)
+        diverse_k = top_n - top_k
+        top_recs = hasil_sorted[:top_k]
+        diverse_pool = hasil_sorted[top_k:]
+        if diverse_pool and diverse_k > 0:
+            diverse_recs = random.sample(diverse_pool, min(diverse_k, len(diverse_pool)))
+        else:
+            diverse_recs = []
+        final_recs = top_recs + diverse_recs
+        random.shuffle(final_recs)
+
         recommendations = []
-        for rec in recommendations_data:
-            if rec['similarity_score'] > 0.7:
+        for score, rec in final_recs:
+            if score > 0.7:
                 relevance = "High match"
-            elif rec['similarity_score'] > 0.4:
+            elif score > 0.4:
                 relevance = "Good match"
             else:
                 relevance = "Related item"
-            
             recommendations.append(ProductRecommendation(
-                product_id=rec['product_id'],
-                product_name=rec['product_name'],
-                seller_id=rec['seller_id'],
-                product_price=rec['price'],
-                similarity_score=rec['similarity_score'],
-                category_id=rec['category_id'],
-                category_name=rec['category_name'],
-                recommendation_reason=f"{relevance} for '{req.keyword}' (score: {rec['similarity_score']:.3f})"
+                product_id=rec.get('product_id', 0),
+                product_name=rec.get('product_name', ''),
+                seller_id=rec.get('seller_id', 0),
+                product_price=rec.get('price', 0.0),
+                similarity_score=score,
+                category_id=rec.get('category_id', 0),
+                category_name=rec.get('category_name', ''),
+                recommendation_reason=f"{relevance} for '{req.keyword}' (score: {score:.3f})"
             ))
-        
+        logger.info(f"Returning {len(recommendations)} strict-category search recommendations for keyword '{req.keyword}'")
         return RecommendationResponse(
             recommendations=recommendations,
             total_found=len(recommendations),
-            algorithm_used="semantic_search_exclude_owned",
-            query_info=f"Search: '{req.keyword}' - guaranteed 10 results (excluding user {req.user_id} owned items)"
+            algorithm_used="semantic_search+model_search+strict_category",
+            query_info=f"Search: '{req.keyword}' - only exact category match"
         )
-        
     except Exception as e:
         logger.error(f"Error in search recommendations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/recommend/item", response_model=RecommendationResponse)
 def recommend_item(req: ItemRequest):
-    """Get item recommendations using pre-calculated similarities"""
+    logger.info(f"Received /recommend/item request: {req}")
     try:
         if not engine.is_initialized:
             engine.initialize()
-        
         recommendations_data = engine.get_item_recommendations(req.product_id, req.user_id, req.top_n)
-        
         recommendations = []
         for rec in recommendations_data:
-            if rec['similarity_score'] > 0.8:
+            if rec.get('similarity_score', 0.0) > 0.8:
                 similarity_type = "Very similar"
-            elif rec['similarity_score'] > 0.6:
+            elif rec.get('similarity_score', 0.0) > 0.6:
                 similarity_type = "Similar"
             else:
                 similarity_type = "Related"
-            
             recommendations.append(ProductRecommendation(
-                product_id=rec['product_id'],
-                product_name=rec['product_name'],
-                seller_id=rec['seller_id'],
-                product_price=rec['price'],
-                similarity_score=rec['similarity_score'],
-                category_id=rec['category_id'],
-                category_name=rec['category_name'],
-                recommendation_reason=f"{similarity_type} to product {req.product_id} (score: {rec['similarity_score']:.3f})"
+                product_id=rec.get('product_id', 0),
+                product_name=rec.get('product_name', ''),
+                seller_id=rec.get('seller_id', 0),
+                product_price=rec.get('price', 0.0),
+                similarity_score=rec.get('similarity_score', 0.0),
+                category_id=rec.get('category_id', 0),
+                category_name=rec.get('category_name', ''),
+                recommendation_reason=f"{similarity_type} to product {req.product_id} (score: {rec.get('similarity_score', 0.0):.3f})"
             ))
-        
+        logger.info(f"Returning {len(recommendations)} item recommendations for product {req.product_id}")
         return RecommendationResponse(
             recommendations=recommendations,
             total_found=len(recommendations),
-            algorithm_used="pre_calculated_similarity_exclude_owned",
+            algorithm_used="model_item_embedding_similarity",
             query_info=f"Similar to product {req.product_id} (excluding user {req.user_id} owned items)"
         )
-        
     except Exception as e:
         logger.error(f"Error in item recommendations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1280,20 +1346,23 @@ def health_check():
 def read_root():
     """Root endpoint"""
     return {
-        "message": "Smart Recommendation System v5.3 - Personalized User Recommendations",
+        "message": "Smart Recommendation System v6.0 - Fully Model-Integrated",
         "features": [
             "✅ Personalized recommendations for each user (different results per user)",
-            "✅ Based on user's posted items + user_id-based preferences",
-            "✅ Fixed SQLAlchemy warnings",
-            "✅ Search always returns 10 items",
-            "✅ Uses pre-trained models (.h5 files)",
-            "✅ Consistent but unique recommendations per user",
+            "✅ Item-to-item recommendations using semantic embeddings from `model_item`",
+            "✅ Cold-start user recommendations using preference prediction from `model_user`",
+            "✅ Intelligent search using TF-IDF retrieval and `model_search` re-ranking",
             "✅ Excludes user's own items from all recommendations"
         ],
         "user_recommendation_logic": {
-            "existing_users": "Based on similarity to items they've posted",
-            "new_users": "Personalized based on user_id hash (consistent but different per user)",
+            "existing_users": "Based on collaborative filtering or similarity to items they've posted",
+            "new_users": "Personalized based on `model_user` predictions (data-driven)",
             "validation": "All recommendations exclude items owned by the requesting user"
+        },
+        "item_recommendation_logic": {
+            "primary_method": "Finds nearest neighbors in the embedding space generated by `model_item`",
+            "efficiency": "Uses a pre-calculated cache for fast lookups",
+            "fallback": "Recommends items from the same category if primary fails"
         }
     }
 
